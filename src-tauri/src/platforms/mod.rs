@@ -42,7 +42,7 @@ pub struct SessionAgentGroup {
     pub children: Vec<SessionListItem>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListItem {
     pub platform: String,
@@ -62,6 +62,8 @@ pub struct SessionListItem {
     pub favorite: bool,
     #[serde(default)]
     pub agent_group: Option<SessionAgentGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -441,14 +443,7 @@ pub fn get_adapter(
             Ok(Box::new(claude::ClaudePlatform::new(path)))
         }
         "codex" => {
-            let path = settings
-                .codex_home
-                .as_ref()
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
-                .unwrap_or_else(|| home.join(".codex"));
-            let project_root = settings.codex_project_root.as_ref().map(PathBuf::from);
-            Ok(Box::new(codex::CodexPlatform::new(path, project_root)))
+            Ok(Box::new(codex::CodexPlatform::from_settings(settings)?))
         }
         "cursor" => {
             let path = settings

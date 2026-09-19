@@ -11,6 +11,8 @@ export type DesktopSettings = {
   reduceMotion: boolean;
   claudeHome: string | null;
   codexHome: string | null;
+  codexInstancesDir: string | null;
+  codexActiveProfile: string | null;
   codexProjectRoot: string | null;
   cursorHome: string | null;
   opencodePath: string | null;
@@ -42,6 +44,14 @@ export type DesktopSnapshot = {
 // ─── Session ───
 
 export type Platform = "claude" | "codex" | "cursor" | "opencode" | "kiro" | "kiro-ide" | "gemini" | "grok" | "pi";
+
+export interface CodexProfile {
+  id: string;
+  name: string;
+  path: string;
+  sessionsPath: string;
+  sessionCount: number;
+}
 
 export type ContentMatch = {
   snippet: string;
@@ -75,6 +85,7 @@ export type Session = {
   contentMatches?: ContentMatch[];
   totalContentMatches?: number;
   favorite?: boolean;
+  profile?: string | null;
   agentGroup?: {
     parentSessionId?: string | null;
     depth?: number | null;

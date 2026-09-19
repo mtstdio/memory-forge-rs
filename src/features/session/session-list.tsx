@@ -9,7 +9,7 @@ import { useDesktop } from '@/features/desktop/provider'
 import { api } from '@/features/desktop/api'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { RefreshCw, Search, CheckCircle, Copy, Check, Clock, FolderOpen, User, Bot, MessageSquareText, Star, Archive, ArchiveRestore, ChevronDown, ChevronUp, CheckSquare, X, Upload, FileJson, AlertTriangle } from 'lucide-react'
-import type { RawJsonlImportPreview, Session } from '@/features/desktop/types'
+import type { CodexProfile, RawJsonlImportPreview, Session } from '@/features/desktop/types'
 
 function formatTime(timestamp: string, justNowLabel: string): string {
   try {
@@ -76,7 +76,7 @@ function countSubagents(session: Session): number {
 }
 
 export function SessionList() {
-  const { t, state, dispatch } = useDesktop()
+  const { t, state, dispatch, snapshot } = useDesktop()
   const currentPlatform = state.currentPlatform
   const sessions = state.sessions
   const selectedSessionKey = state.selectedSessionKey
@@ -97,6 +97,33 @@ export function SessionList() {
   const [probingImport, setProbingImport] = useState(false)
   const [committingImport, setCommittingImport] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
+  const [codexProfiles, setCodexProfiles] = useState<CodexProfile[]>([])
+  const [activeProfile, setActiveProfile] = useState<string>(
+    snapshot?.settings?.codexActiveProfile || 'all'
+  )
+
+  useEffect(() => {
+    if (snapshot?.settings?.codexActiveProfile) {
+      setActiveProfile(snapshot.settings.codexActiveProfile)
+    }
+  }, [snapshot?.settings?.codexActiveProfile])
+
+  useEffect(() => {
+    if (currentPlatform === 'codex') {
+      api.getCodexProfiles().then(setCodexProfiles).catch(console.error)
+    } else {
+      setCodexProfiles([])
+    }
+  }, [currentPlatform])
+
+  const handleProfileChange = async (profileId: string) => {
+    setActiveProfile(profileId)
+    try {
+      await api.setCodexActiveProfile(profileId)
+    } catch (err) {
+      console.error('Failed to set active codex profile:', err)
+    }
+  }
 
   const showArchived = state.showArchived
   const { confirm, dialogProps } = useConfirmDialog()
@@ -128,7 +155,8 @@ export function SessionList() {
       try {
         const isSearch = searchQuery.trim().length > 0
         console.time(`[perf] getSessions(${currentPlatform}, search=${isSearch})`)
-        const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived)
+        const profileParam = currentPlatform === 'codex' ? activeProfile : undefined
+        const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived, profileParam)
         console.timeEnd(`[perf] getSessions(${currentPlatform}, search=${isSearch})`)
         if (cancelled || requestId !== requestIdRef.current) return
         dispatch({ type: 'setSessions', payload: result.items })
@@ -150,7 +178,7 @@ export function SessionList() {
     return () => {
       cancelled = true
     }
-  }, [currentPlatform, searchQuery, showArchived])
+  }, [currentPlatform, searchQuery, showArchived, activeProfile])
 
   useEffect(() => {
     if (!searchQuery.trim() || !searchIndex.running) return
@@ -161,7 +189,8 @@ export function SessionList() {
       polling = true
       const requestId = ++requestIdRef.current
       try {
-        const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived)
+        const profileParam = currentPlatform === 'codex' ? activeProfile : undefined
+        const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived, profileParam)
         if (disposed || requestId !== requestIdRef.current) return
         dispatch({ type: 'setSessions', payload: result.items })
         setTotalCount(result.total)
@@ -177,7 +206,7 @@ export function SessionList() {
       disposed = true
       clearInterval(timer)
     }
-  }, [currentPlatform, dispatch, searchIndex.running, searchQuery, showArchived])
+  }, [currentPlatform, dispatch, searchIndex.running, searchQuery, showArchived, activeProfile])
 
   useEffect(() => {
     if (!selectedSessionKey || currentPlatform === 'dashboard' || currentPlatform === 'about' || currentPlatform === 'prompts' || currentPlatform === 'settings') return
@@ -205,7 +234,11 @@ export function SessionList() {
     setRefreshing(true)
     setRefreshDone(false)
     try {
-      const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived)
+      if (currentPlatform === 'codex') {
+        api.getCodexProfiles().then(setCodexProfiles).catch(console.error)
+      }
+      const profileParam = currentPlatform === 'codex' ? activeProfile : undefined
+      const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, 0, showArchived, profileParam)
       dispatch({ type: 'setSessions', payload: result.items })
       setTotalCount(result.total)
       setSearchIndex(result.searchIndex)
@@ -222,7 +255,8 @@ export function SessionList() {
   const handleLoadMore = async () => {
     setLoadingMore(true)
     try {
-      const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, sessions.length, showArchived)
+      const profileParam = currentPlatform === 'codex' ? activeProfile : undefined
+      const result = await api.getSessions(currentPlatform, searchQuery, PAGE_SIZE, sessions.length, showArchived, profileParam)
       dispatch({ type: 'setSessions', payload: [...sessions, ...result.items] })
       setTotalCount(result.total)
       setSearchIndex(result.searchIndex)
@@ -476,6 +510,22 @@ export function SessionList() {
             </Button>
           </div>
         </div>
+        {currentPlatform === 'codex' && (
+          <div className="mb-3">
+            <select
+              value={activeProfile}
+              onChange={(e) => handleProfileChange(e.target.value)}
+              className="w-full text-xs bg-muted/20 border border-border/40 hover:border-border/80 focus:border-primary/40 focus:ring-1 focus:ring-primary/40 text-foreground rounded-xl px-3 py-2 outline-none transition-all cursor-pointer"
+            >
+              <option value="all">{t('codexProfileAll')}</option>
+              {codexProfiles.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50" />
           <Input
@@ -783,6 +833,14 @@ function SessionCard({ session, isSelected, selectedSessionKey, showArchived, se
           <h3 className={cn("font-bold text-sm truncate min-w-0 transition-colors duration-200 flex-1", highlightAsSelection ? "text-primary" : "text-foreground group-hover:text-foreground")}>
             {session.displayTitle || session.sessionId || untitledLabel}
           </h3>
+          {session.profile && (
+            <span
+              className="text-[10px] font-medium text-orange-400 bg-orange-500/10 border border-orange-500/20 px-1.5 py-0.5 rounded-md flex-shrink-0 max-w-[80px] truncate"
+              title={session.profile}
+            >
+              {session.profile}
+            </span>
+          )}
         </div>
         {!selectionMode && (
           <div className="flex items-center gap-1.5 flex-shrink-0 h-6">

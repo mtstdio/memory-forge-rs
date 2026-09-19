@@ -23,6 +23,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub codex_home: Option<String>,
     #[serde(default)]
+    pub codex_instances_dir: Option<String>,
+    #[serde(default)]
+    pub codex_active_profile: Option<String>,
+    #[serde(default)]
     pub codex_project_root: Option<String>,
     #[serde(default)]
     pub cursor_home: Option<String>,
@@ -120,6 +124,8 @@ impl Default for AppSettings {
             reduce_motion: false,
             claude_home: None,
             codex_home: None,
+            codex_instances_dir: None,
+            codex_active_profile: None,
             codex_project_root: None,
             cursor_home: None,
             opencode_path: None,
@@ -145,6 +151,8 @@ pub struct AppSettingsPatch {
     pub reduce_motion: Option<bool>,
     pub claude_home: Option<Option<String>>,
     pub codex_home: Option<Option<String>>,
+    pub codex_instances_dir: Option<Option<String>>,
+    pub codex_active_profile: Option<Option<String>>,
     pub codex_project_root: Option<Option<String>>,
     pub cursor_home: Option<Option<String>>,
     pub opencode_path: Option<Option<String>>,
@@ -255,6 +263,14 @@ pub fn update_settings(
 
     if let Some(codex_home) = patch.codex_home {
         settings.codex_home = codex_home.filter(|s| !s.trim().is_empty());
+    }
+
+    if let Some(codex_instances_dir) = patch.codex_instances_dir {
+        settings.codex_instances_dir = codex_instances_dir.filter(|s| !s.trim().is_empty());
+    }
+
+    if let Some(codex_active_profile) = patch.codex_active_profile {
+        settings.codex_active_profile = codex_active_profile.filter(|s| !s.trim().is_empty());
     }
 
     if let Some(codex_project_root) = patch.codex_project_root {

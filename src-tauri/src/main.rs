@@ -79,6 +79,7 @@ async fn session_list(
     limit: Option<usize>,
     offset: Option<usize>,
     show_archived: Option<bool>,
+    profile_id: Option<String>,
 ) -> Result<session_service::SessionListResponse, String> {
     let settings = settings_state
         .settings
@@ -96,10 +97,39 @@ async fn session_list(
             limit,
             offset.unwrap_or(0),
             show_archived.unwrap_or(false),
+            profile_id.as_deref(),
         )
     })
     .await
     .map_err(|e| format!("Task error: {e}"))?
+}
+
+#[tauri::command]
+async fn codex_list_profiles(
+    settings_state: tauri::State<'_, SharedSettingsState>,
+) -> Result<Vec<platforms::codex::CodexProfile>, String> {
+    let settings = settings_state
+        .settings
+        .lock()
+        .map_err(|_| "lock error".to_string())?
+        .clone();
+    Ok(session_service::list_codex_profiles(&settings))
+}
+
+#[tauri::command]
+async fn codex_set_active_profile(
+    app: tauri::AppHandle,
+    settings_state: tauri::State<'_, SharedSettingsState>,
+    profile_id: Option<String>,
+) -> Result<settings::DesktopSnapshot, String> {
+    settings::update_settings(
+        &app,
+        settings_state.inner(),
+        settings::AppSettingsPatch {
+            codex_active_profile: Some(profile_id),
+            ..Default::default()
+        },
+    )
 }
 
 #[tauri::command]
@@ -458,6 +488,8 @@ fn main() {
             write_text_file,
             dashboard_summary,
             session_list,
+            codex_list_profiles,
+            codex_set_active_profile,
             session_detail,
             session_execution_output,
             session_execution_outputs,

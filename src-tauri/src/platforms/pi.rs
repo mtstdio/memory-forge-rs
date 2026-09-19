@@ -355,6 +355,7 @@ impl PlatformAdapter for PiPlatform {
                     total_content_matches: 0,
                     favorite: false,
                     agent_group: None,
+                    profile: None,
                 })
             })
             .collect();
@@ -400,6 +401,7 @@ impl PlatformAdapter for PiPlatform {
                     total_content_matches: 0,
                     favorite: false,
                     agent_group: None,
+                    profile: None,
                 })
             })
             .collect();
@@ -454,6 +456,7 @@ impl PlatformAdapter for PiPlatform {
             total_content_matches: 0,
             favorite: false,
             agent_group: None,
+            profile: None,
         })
     }
 

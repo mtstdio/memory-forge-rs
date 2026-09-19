@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CodexProfile,
   DashboardSummary,
   DesktopSettingsPatch,
   DesktopSnapshot,
@@ -27,6 +28,8 @@ const defaultSettings = {
   reduceMotion: false,
   claudeHome: null,
   codexHome: null,
+  codexInstancesDir: null,
+  codexActiveProfile: null,
   codexProjectRoot: null,
   cursorHome: null,
   opencodePath: null,
@@ -296,8 +299,33 @@ export const api = {
     return fetchJSON<DashboardSummary>(`${API_BASE}/dashboard/summary`);
   },
 
+  // Profiles
+  async getCodexProfiles(): Promise<CodexProfile[]> {
+    if (isTauriRuntime()) {
+      return invoke<CodexProfile[]>("codex_list_profiles");
+    }
+    return [];
+  },
+
+  async setCodexActiveProfile(profileId?: string | null): Promise<DesktopSnapshot> {
+    if (isTauriRuntime()) {
+      return invoke<DesktopSnapshot>("codex_set_active_profile", { profileId: profileId ?? null });
+    }
+    const current = readWebSnapshot();
+    const next = { ...current, settings: { ...current.settings, codexActiveProfile: profileId ?? null } };
+    writeWebSnapshot(next);
+    return next;
+  },
+
   // Sessions
-  async getSessions(platform: string, q: string = "", limit?: number, offset?: number, showArchived?: boolean): Promise<SessionListResult> {
+  async getSessions(
+    platform: string,
+    q: string = "",
+    limit?: number,
+    offset?: number,
+    showArchived?: boolean,
+    profileId?: string
+  ): Promise<SessionListResult> {
     if (isTauriRuntime()) {
       return invoke<SessionListResult>("session_list", {
         platform,
@@ -305,6 +333,7 @@ export const api = {
         limit: limit ?? null,
         offset: offset ?? null,
         showArchived: showArchived ?? false,
+        profileId: profileId ?? null,
       });
     }
     const params = q ? `?q=${encodeURIComponent(q)}` : "";

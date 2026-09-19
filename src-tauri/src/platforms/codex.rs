@@ -4,11 +4,13 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::database::{
     CachedSessionSummary, SessionContentEntry, SessionContentIndex, SessionSummaryCache,
 };
+use crate::settings::AppSettings;
 
 use super::{
     build_commands, content_entries_to_matches, push_bounded_index_entry, tool_text_from_str,
@@ -17,9 +19,20 @@ use super::{
     TimelineBlock, ToolCallBlock, MAX_INDEX_SOURCE_LINE_BYTES,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfile {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub sessions_path: String,
+    pub session_count: usize,
+}
+
 pub struct CodexPlatform {
-    sessions_root: PathBuf,
-    project_root: Option<PathBuf>,
+    pub profiles: Vec<CodexProfile>,
+    pub active_profile_id: Option<String>,
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -47,12 +60,214 @@ struct CodexTextPart {
     text: String,
 }
 
+pub fn discover_codex_profiles(settings: &AppSettings) -> Vec<CodexProfile> {
+    let mut profiles = Vec::new();
+    let home = dirs::home_dir();
+
+    // 1. 默认 ~/.codex
+    let default_codex_home = settings
+        .codex_home
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .or_else(|| home.as_ref().map(|h| h.join(".codex")));
+
+    if let Some(ref default_home) = default_codex_home {
+        let sessions_dir = default_home.join("sessions");
+        if sessions_dir.exists() {
+            let mut entries = Vec::new();
+            collect_jsonl_recursive(&sessions_dir, &mut entries);
+            profiles.push(CodexProfile {
+                id: "default".to_string(),
+                name: "Default".to_string(),
+                path: default_home.to_string_lossy().to_string(),
+                sessions_path: sessions_dir.to_string_lossy().to_string(),
+                session_count: entries.len(),
+            });
+        }
+    }
+
+    // 2. 多 Profile 实例根路径
+    let instances_dir = settings
+        .codex_instances_dir
+        .as_ref()
+        .map(|dir_str| {
+            if dir_str.starts_with("~/") || dir_str == "~" {
+                if let Some(ref h) = home {
+                    h.join(dir_str.strip_prefix("~/").unwrap_or(""))
+                } else {
+                    PathBuf::from(dir_str)
+                }
+            } else {
+                PathBuf::from(dir_str)
+            }
+        })
+        .or_else(|| {
+            home.as_ref()
+                .map(|h| h.join(".antigravity_cockpit").join("instances"))
+        });
+
+    if let Some(inst_dir) = instances_dir {
+        let codex_instances_dir = if inst_dir.join("codex").is_dir() {
+            inst_dir.join("codex")
+        } else {
+            inst_dir.clone()
+        };
+
+        let meta_candidates = [
+            inst_dir.parent().map(|p| p.join("codex_instances.json")),
+            Some(inst_dir.join("codex_instances.json")),
+            home.as_ref().map(|h| h.join(".antigravity_cockpit").join("codex_instances.json")),
+        ];
+
+        let mut instance_names: HashMap<String, String> = HashMap::new();
+        for meta_path_opt in meta_candidates.into_iter().flatten() {
+            if meta_path_opt.exists() {
+                if let Ok(content) = fs::read_to_string(&meta_path_opt) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&content) {
+                        if let Some(instances) = val.get("instances").and_then(Value::as_array) {
+                            for item in instances {
+                                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                                let user_data_dir = item
+                                    .get("userDataDir")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if !name.is_empty() {
+                                    if !id.is_empty() {
+                                        instance_names.insert(id.to_string(), name.to_string());
+                                    }
+                                    if !user_data_dir.is_empty() {
+                                        instance_names
+                                            .insert(user_data_dir.to_string(), name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if codex_instances_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&codex_instances_dir) {
+                let mut subdirs: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                subdirs.sort();
+
+                for subdir in subdirs {
+                    let sessions_dir = subdir.join("sessions");
+                    if sessions_dir.exists() {
+                        let dir_str = subdir.to_string_lossy().to_string();
+                        let dir_name = subdir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        let name = instance_names
+                            .get(&dir_str)
+                            .or_else(|| instance_names.get(&dir_name))
+                            .cloned()
+                            .unwrap_or_else(|| dir_name.clone());
+
+                        let id = dir_name;
+
+                        if !profiles.iter().any(|p| p.path == dir_str || p.id == id) {
+                            let mut files = Vec::new();
+                            collect_jsonl_recursive(&sessions_dir, &mut files);
+                            profiles.push(CodexProfile {
+                                id,
+                                name,
+                                path: dir_str,
+                                sessions_path: sessions_dir.to_string_lossy().to_string(),
+                                session_count: files.len(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    profiles
+}
+
 impl CodexPlatform {
     pub fn new(codex_home: PathBuf, project_root: Option<PathBuf>) -> Self {
+        let sessions_path = codex_home.join("sessions");
+        let profile = CodexProfile {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            path: codex_home.to_string_lossy().to_string(),
+            sessions_path: sessions_path.to_string_lossy().to_string(),
+            session_count: 0,
+        };
         Self {
-            sessions_root: codex_home.join("sessions"),
+            profiles: vec![profile],
+            active_profile_id: Some("default".to_string()),
             project_root,
         }
+    }
+
+    pub fn from_settings(settings: &AppSettings) -> Result<Self, String> {
+        let profiles = discover_codex_profiles(settings);
+        let project_root = settings.codex_project_root.as_ref().map(PathBuf::from);
+        let active_profile_id = settings.codex_active_profile.clone();
+        Ok(Self {
+            profiles,
+            active_profile_id,
+            project_root,
+        })
+    }
+
+    pub fn with_active_profile(mut self, active_profile_id: Option<String>) -> Self {
+        self.active_profile_id = active_profile_id;
+        self
+    }
+
+    fn target_profiles(&self) -> Vec<&CodexProfile> {
+        match self.active_profile_id.as_deref() {
+            None | Some("") | Some("all") => self.profiles.iter().collect(),
+            Some(target_id) => {
+                let matched: Vec<&CodexProfile> = self
+                    .profiles
+                    .iter()
+                    .filter(|p| p.id == target_id || p.name == target_id)
+                    .collect();
+                if matched.is_empty() {
+                    self.profiles.iter().collect()
+                } else {
+                    matched
+                }
+            }
+        }
+    }
+
+    fn collect_target_entries(&self) -> Vec<PathBuf> {
+        let mut entries = Vec::new();
+        for profile in self.target_profiles() {
+            let sessions_root = PathBuf::from(&profile.sessions_path);
+            if sessions_root.exists() {
+                collect_jsonl_recursive(&sessions_root, &mut entries);
+            }
+        }
+        entries.sort_by(|a, b| modified_nanos(b).cmp(&modified_nanos(a)));
+        entries
+    }
+
+    fn profile_for_path(&self, path: &Path) -> Option<String> {
+        let path_str = path.to_string_lossy();
+        for profile in &self.profiles {
+            if path_str.starts_with(&profile.sessions_path) || path_str.starts_with(&profile.path) {
+                return Some(profile.name.clone());
+            }
+        }
+        None
     }
 
     fn read_jsonl(&self, path: &Path) -> Vec<Value> {
@@ -630,16 +845,13 @@ impl PlatformAdapter for CodexPlatform {
         limit: Option<usize>,
         offset: usize,
     ) -> SessionListResult {
-        if !self.sessions_root.exists() {
+        let entries = self.collect_target_entries();
+        if entries.is_empty() {
             return SessionListResult {
                 total: 0,
                 items: Vec::new(),
             };
         }
-
-        let mut entries = Vec::new();
-        collect_jsonl_recursive(&self.sessions_root, &mut entries);
-        entries.sort_by(|a, b| modified_nanos(b).cmp(&modified_nanos(a)));
 
         if self.project_root.is_none() {
             let total = entries.len();
@@ -685,16 +897,13 @@ impl PlatformAdapter for CodexPlatform {
         offset: usize,
         cache: Option<&SessionSummaryCache<'_>>,
     ) -> SessionListResult {
-        if !self.sessions_root.exists() {
+        let entries = self.collect_target_entries();
+        if entries.is_empty() {
             return SessionListResult {
                 total: 0,
                 items: Vec::new(),
             };
         }
-
-        let mut entries = Vec::new();
-        collect_jsonl_recursive(&self.sessions_root, &mut entries);
-        entries.sort_by(|a, b| modified_nanos(b).cmp(&modified_nanos(a)));
 
         if self.project_root.is_none() {
             let total = entries.len();
@@ -734,12 +943,11 @@ impl PlatformAdapter for CodexPlatform {
     }
 
     fn list_session_keys(&self) -> Option<Vec<SessionKey>> {
-        if !self.sessions_root.exists() || self.project_root.is_some() {
+        if self.project_root.is_some() {
             return None;
         }
 
-        let mut entries = Vec::new();
-        collect_jsonl_recursive(&self.sessions_root, &mut entries);
+        let entries = self.collect_target_entries();
         Some(
             entries
                 .into_iter()
@@ -1257,6 +1465,7 @@ impl CodexPlatform {
                 orphaned: false,
                 children: Vec::new(),
             }),
+            profile: self.profile_for_path(path),
         }
     }
 }
@@ -1575,5 +1784,96 @@ mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.items[0].session_id, "inside");
         assert_eq!(result.items[0].preview, "inside");
+    }
+
+    #[test]
+    fn multi_profile_discovery_and_filtering() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-forge-codex-multi-profile-test-{}",
+            std::process::id()
+        ));
+        let default_home = root.join("default-home");
+        let default_sessions = default_home.join("sessions");
+        fs::create_dir_all(&default_sessions).expect("create default sessions");
+        fs::write(
+            default_sessions.join("session-default.jsonl"),
+            serde_json::to_string(&json!({
+                "payload": {
+                    "type": "user_message",
+                    "id": "session-default",
+                    "cwd": "/workspace/default",
+                    "message": "hello from default"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let instances_root = root.join("instances");
+        let cockpit_root = root.clone();
+        let inst_profile1 = instances_root.join("codex").join("inst_01");
+        let inst_profile1_sessions = inst_profile1.join("sessions");
+        fs::create_dir_all(&inst_profile1_sessions).expect("create profile1 sessions");
+        fs::write(
+            inst_profile1_sessions.join("session-p1.jsonl"),
+            serde_json::to_string(&json!({
+                "payload": {
+                    "type": "user_message",
+                    "id": "session-p1",
+                    "cwd": "/workspace/p1",
+                    "message": "hello from p1"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // 写入 codex_instances.json
+        fs::write(
+            cockpit_root.join("codex_instances.json"),
+            serde_json::to_string(&json!({
+                "instances": [
+                    {
+                        "id": "inst_01",
+                        "name": "Custom Profile 1",
+                        "userDataDir": inst_profile1.to_string_lossy().to_string()
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = AppSettings {
+            codex_home: Some(default_home.to_string_lossy().to_string()),
+            codex_instances_dir: Some(instances_root.to_string_lossy().to_string()),
+            ..AppSettings::default()
+        };
+
+        // 1. 验证 Profile 发现
+        let profiles = discover_codex_profiles(&settings);
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|p| p.id == "default" && p.session_count == 1));
+        assert!(profiles.iter().any(|p| p.name == "Custom Profile 1" && p.session_count == 1));
+
+        // 2. 验证全部聚合视图
+        let platform_all = CodexPlatform::from_settings(&settings).unwrap();
+        let list_all = platform_all.list_sessions(&HashMap::new(), None, 0);
+        assert_eq!(list_all.total, 2);
+        assert!(list_all.items.iter().any(|i| i.profile.as_deref() == Some("Default")));
+        assert!(list_all.items.iter().any(|i| i.profile.as_deref() == Some("Custom Profile 1")));
+
+        // 3. 验证单 Profile 过滤 (指定 inst_01)
+        let settings_p1 = AppSettings {
+            codex_active_profile: Some("inst_01".to_string()),
+            ..settings.clone()
+        };
+        let platform_p1 = CodexPlatform::from_settings(&settings_p1).unwrap();
+        let list_p1 = platform_p1.list_sessions(&HashMap::new(), None, 0);
+        assert_eq!(list_p1.total, 1);
+        assert_eq!(list_p1.items[0].session_id, "session-p1");
+        assert_eq!(list_p1.items[0].profile.as_deref(), Some("Custom Profile 1"));
+
+        fs::remove_dir_all(root).ok();
     }
 }

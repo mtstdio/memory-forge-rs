@@ -235,6 +235,9 @@ export type MessageKey =
   | "platformPathsDesc"
   | "claudeHomePath"
   | "codexHomePath"
+  | "codexInstancesPath"
+  | "codexProfileAll"
+  | "codexProfileSelect"
   | "codexProjectRootPath"
   | "cursorHomePath"
   | "opencodePath"
@@ -551,6 +554,9 @@ const messages: Record<LocaleId, Record<MessageKey, string>> = {
     "platformPathsDesc": "自定义各平台的数据目录。留空则使用默认路径。",
     "claudeHomePath": "Claude 数据目录",
     "codexHomePath": "Codex 数据目录",
+    "codexInstancesPath": "Codex 多 Profile 实例路径",
+    "codexProfileAll": "全部实例",
+    "codexProfileSelect": "切换 Profile",
     "codexProjectRootPath": "Codex 项目根目录",
     "cursorHomePath": "Cursor 数据目录",
     "opencodePath": "OpenCode 数据库路径",
@@ -866,6 +872,9 @@ const messages: Record<LocaleId, Record<MessageKey, string>> = {
     "platformPathsDesc": "Customize data directories for each platform. Leave empty to use defaults.",
     "claudeHomePath": "Claude Home Directory",
     "codexHomePath": "Codex Home Directory",
+    "codexInstancesPath": "Codex Instances Directory",
+    "codexProfileAll": "All Profiles",
+    "codexProfileSelect": "Switch Profile",
     "codexProjectRootPath": "Codex Project Root",
     "cursorHomePath": "Cursor Data Directory",
     "opencodePath": "OpenCode Database Path",

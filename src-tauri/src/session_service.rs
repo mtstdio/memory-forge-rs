@@ -205,6 +205,10 @@ fn dashboard_platform_summary(
     Ok((summary, items))
 }
 
+pub fn list_codex_profiles(settings: &AppSettings) -> Vec<platforms::codex::CodexProfile> {
+    platforms::codex::discover_codex_profiles(settings)
+}
+
 pub fn session_list(
     db: &DbState,
     settings: &AppSettings,
@@ -213,9 +217,16 @@ pub fn session_list(
     limit: Option<usize>,
     offset: usize,
     show_archived: bool,
+    profile_id: Option<&str>,
 ) -> Result<SessionListResponse, String> {
     let t0 = Instant::now();
-    let adapter = platforms::get_adapter(platform, settings)?;
+    let mut custom_settings = settings.clone();
+    if platform == "codex" {
+        if let Some(pid) = profile_id {
+            custom_settings.codex_active_profile = Some(pid.to_string());
+        }
+    }
+    let adapter = platforms::get_adapter(platform, &custom_settings)?;
     let aliases = database::get_alias_map(&db.conn, platform)?;
     let archived = database::get_flagged_keys(&db.conn, platform, "archived").unwrap_or_default();
     let favorites = database::get_flagged_keys(&db.conn, platform, "favorite").unwrap_or_default();
@@ -1009,6 +1020,7 @@ mod tests {
                 orphaned: false,
                 children: Vec::new(),
             }),
+            profile: None,
         }
     }
 
@@ -1094,6 +1106,7 @@ mod tests {
             Some(50),
             0,
             false,
+            None,
         )
         .expect("initial indexed search");
         assert!(first.items.is_empty());
@@ -1123,6 +1136,7 @@ mod tests {
             Some(50),
             0,
             false,
+            None,
         )
         .expect("completed indexed search");
         assert_eq!(second.items.len(), 1);

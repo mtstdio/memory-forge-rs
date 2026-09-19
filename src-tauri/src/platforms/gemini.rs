@@ -412,6 +412,7 @@ impl PlatformAdapter for GeminiPlatform {
                     total_content_matches: 0,
                     favorite: false,
                     agent_group: None,
+                    profile: None,
                 })
             })
             .collect();

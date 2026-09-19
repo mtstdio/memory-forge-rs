@@ -136,6 +136,7 @@ impl super::PlatformAdapter for OpenCodePlatform {
                 total_content_matches: 0,
                 favorite: false,
                 agent_group: None,
+                profile: None,
             });
         }
         SessionListResult { total, items }
@@ -207,6 +208,7 @@ impl super::PlatformAdapter for OpenCodePlatform {
             total_content_matches: 0,
             favorite: false,
             agent_group: None,
+            profile: None,
         })
     }
 

@@ -450,6 +450,13 @@ export default function SettingsPage() {
               value={snapshot.settings.codexHome ?? ""}
             />
             <PathRow
+              defaultHint="~/.antigravity_cockpit/instances"
+              label={t("codexInstancesPath")}
+              onSave={(v) => updateSettings({ codexInstancesDir: v || null })}
+              pickMode="directory"
+              value={snapshot.settings.codexInstancesDir ?? ""}
+            />
+            <PathRow
               defaultHint="例如 F:\workspacevk；留空显示全部 Codex 会话"
               label={t("codexProjectRootPath")}
               onSave={(v) => updateSettings({ codexProjectRoot: v || null })}
