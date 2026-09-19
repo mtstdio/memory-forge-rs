@@ -1091,7 +1091,21 @@ impl PlatformAdapter for CodexPlatform {
             (old_content, role)
         };
 
-        sync_mirrored_message(&mut rows, line_index, &role, &old_content, new_content);
+        let target_id = rows
+            .get(line_index)
+            .and_then(|r| r.get("payload"))
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        sync_mirrored_message(
+            &mut rows,
+            line_index,
+            &role,
+            target_id.as_deref(),
+            &old_content,
+            new_content,
+        );
 
         let serialized = rows
             .iter()
@@ -1101,6 +1115,9 @@ impl PlatformAdapter for CodexPlatform {
 
         fs::write(path, format!("{}\n", serialized.join("\n")))
             .map_err(|error| format!("Write error: {error}"))?;
+
+        let thread_id = self.thread_id(&rows, path);
+        reset_codex_sqlite_projection(path, &thread_id);
 
         Ok(old_content)
     }
@@ -1335,10 +1352,11 @@ fn sync_mirrored_message(
     rows: &mut [Value],
     changed_line_index: usize,
     role: &str,
+    target_id: Option<&str>,
     old_content: &str,
     new_content: &str,
 ) {
-    if role.is_empty() || old_content.is_empty() {
+    if role.is_empty() || (old_content.is_empty() && target_id.is_none()) {
         return;
     }
 
@@ -1346,7 +1364,7 @@ fn sync_mirrored_message(
         if line_index == changed_line_index {
             continue;
         }
-        if line_index.abs_diff(changed_line_index) > 2 {
+        if line_index.abs_diff(changed_line_index) > 8 {
             continue;
         }
 
@@ -1372,8 +1390,73 @@ fn sync_mirrored_message(
                     update_mirrored_response_content(content, old_content, new_content);
                 }
             }
+            Some("item_completed") => {
+                if let Some(item) = payload.get_mut("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                    let role_matches = match role {
+                        "user" => item_type == "userMessage",
+                        "assistant" => item_type == "agentMessage",
+                        _ => false,
+                    };
+                    let id_matches =
+                        target_id.is_some() && item.get("id").and_then(Value::as_str) == target_id;
+
+                    if role_matches || id_matches {
+                        if let Some(content) = item.get_mut("content") {
+                            update_mirrored_response_content(content, old_content, new_content);
+                        }
+                        if item.get("text").and_then(Value::as_str) == Some(old_content)
+                            || (id_matches && !old_content.is_empty())
+                        {
+                            item["text"] = Value::String(new_content.to_string());
+                        }
+                    }
+                }
+            }
+            Some("task_complete") => {
+                if role == "assistant"
+                    && payload.get("last_agent_message").and_then(Value::as_str) == Some(old_content)
+                {
+                    payload["last_agent_message"] = Value::String(new_content.to_string());
+                }
+            }
             _ => {}
         }
+    }
+}
+
+fn reset_codex_sqlite_projection(session_file_path: &Path, thread_id: &str) {
+    if thread_id.is_empty() {
+        return;
+    }
+
+    let mut current = session_file_path.parent();
+    let mut db_path = None;
+    for _ in 0..6 {
+        let Some(dir) = current else { break };
+        let candidate = dir.join("thread_history_1.sqlite");
+        if candidate.exists() {
+            db_path = Some(candidate);
+            break;
+        }
+        current = dir.parent();
+    }
+
+    let Some(db_path) = db_path else {
+        return;
+    };
+
+    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+        let _ = conn.execute("DELETE FROM thread_items WHERE thread_id = ?1", [thread_id]);
+        let _ = conn.execute(
+            "DELETE FROM thread_realtime_items WHERE thread_id = ?1",
+            [thread_id],
+        );
+        let _ = conn.execute("DELETE FROM thread_turns WHERE thread_id = ?1", [thread_id]);
+        let _ = conn.execute(
+            "DELETE FROM thread_history_projection_state WHERE thread_id = ?1",
+            [thread_id],
+        );
     }
 }
 
@@ -1718,6 +1801,92 @@ mod tests {
             updated[1]["payload"]["message"].as_str(),
             Some("new request")
         );
+    }
+
+    #[test]
+    fn update_message_syncs_item_completed_and_resets_sqlite_projection() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-forge-codex-sqlite-test-{}",
+            std::process::id()
+        ));
+        let sessions_dir = root.join("sessions/2026/07/15");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let path = sessions_dir.join("rollout-2026-07-15T15-26-30-019f64ab-875d-7380-b52c-3bcece5ea46f.jsonl");
+
+        let db_path = root.join("thread_history_1.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).expect("open test sqlite");
+        conn.execute_batch(
+            "CREATE TABLE thread_items (thread_id TEXT, rollout_ordinal INTEGER, item_json TEXT);\n\
+             CREATE TABLE thread_realtime_items (thread_id TEXT);\n\
+             CREATE TABLE thread_turns (thread_id TEXT);\n\
+             CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);\n\
+             INSERT INTO thread_items VALUES ('019f64ab-875d-7380-b52c-3bcece5ea46f', 10022, '{\"text\":\"old agent text\"}');\n\
+             INSERT INTO thread_history_projection_state VALUES ('019f64ab-875d-7380-b52c-3bcece5ea46f', 12345, 10025);"
+        ).expect("setup test tables");
+
+        let rows = vec![
+            json!({ "type": "session_meta", "payload": { "id": "019f64ab-875d-7380-b52c-3bcece5ea46f" } }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "id": "msg_001",
+                        "type": "agentMessage",
+                        "content": [{ "type": "output_text", "text": "old agent text" }]
+                    }
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "id": "msg_001",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "old agent text" }]
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "old agent text"
+                }
+            }),
+        ];
+
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                rows.iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("serialize rows")
+                    .join("\n")
+            ),
+        ).expect("write rollout");
+
+        let platform = CodexPlatform::new(root.clone(), None);
+        let edit_target = format!("{}::2::0::text", path.to_string_lossy());
+        let old = platform.update_message(&edit_target, "").expect("erase message");
+        assert_eq!(old, "old agent text");
+
+        let updated = platform.read_jsonl(&path);
+        // Verify response_item is erased
+        assert_eq!(updated[2]["payload"]["content"][0]["text"].as_str(), Some(""));
+        // Verify item_completed is erased
+        assert_eq!(updated[1]["payload"]["item"]["content"][0]["text"].as_str(), Some(""));
+        // Verify task_complete is erased
+        assert_eq!(updated[3]["payload"]["last_agent_message"].as_str(), Some(""));
+
+        // Verify sqlite projection is reset
+        let count: i64 = conn.query_row("SELECT count(*) FROM thread_items WHERE thread_id = '019f64ab-875d-7380-b52c-3bcece5ea46f'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let proj_count: i64 = conn.query_row("SELECT count(*) FROM thread_history_projection_state WHERE thread_id = '019f64ab-875d-7380-b52c-3bcece5ea46f'", [], |row| row.get(0)).unwrap();
+        assert_eq!(proj_count, 0);
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
