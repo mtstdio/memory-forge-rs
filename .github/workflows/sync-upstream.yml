@@ -1,0 +1,41 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/voidcraft-dev/memory-forge-rs.git 2>/dev/null || true
+          git fetch upstream --tags
+
+      - name: Fast-forward origin/main to upstream/main
+        run: |
+          git checkout -B main origin/main
+          git merge --ff-only upstream/main
+          git push origin main --tags
+
+      - name: Merge upstream into release branch
+        run: |
+          git checkout release
+          git merge main -m "chore: sync upstream main into release"
+          git push origin release

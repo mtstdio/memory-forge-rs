@@ -1,9 +1,22 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '发布版本 Tag（例如 v3.4.1，留空则自动从 package.json 提取）'
+        required: false
+        default: ''
+      release_notes:
+        description: '自定义更新说明（可选）'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -30,6 +43,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Resolve Release Info
+        id: release_info
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="v$VERSION"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -58,18 +85,14 @@ jobs:
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Memory Forge ${{ github.ref_name }}'
+          tagName: ${{ steps.release_info.outputs.tag }}
+          releaseName: 'Memory Forge ${{ steps.release_info.outputs.tag }}'
           releaseBody: |
-            ## Memory Forge ${{ github.ref_name }}
+            ## Memory Forge ${{ steps.release_info.outputs.tag }}
 
-            ### 更新 / Changes
-
-            - Codex 子代理：子代理会话自动折叠到主代理之下，支持多级嵌套展开，搜索命中子代理时会自动带出所属主代理。
-            - OpenCode 工具调用：擦除现在会完整清除工具调用的输入、输出、错误与状态，被拒绝的工具调用也能彻底删除。
-            - 会话搜索：改为本地增量索引，修复长会话搜索时界面卡死、无响应的问题。
+            ${{ inputs.release_notes }}
 
             ### 下载 / Download
 
@@ -90,12 +113,14 @@ jobs:
         shell: pwsh
         run: |
           $exe = "src-tauri\target\release\memory-forge.exe"
-          $zip = "Memory.Forge_${{ github.ref_name }}_x64-portable.zip"
+          $tag = "${{ steps.release_info.outputs.tag }}"
+          $zip = "Memory.Forge_${tag}_x64-portable.zip"
           Compress-Archive -Path $exe -DestinationPath $zip
           echo "PORTABLE_ZIP=$zip" >> $env:GITHUB_ENV
 
       - name: Upload Windows portable zip to Release
         if: matrix.platform == 'windows-latest'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} "${{ env.PORTABLE_ZIP }}" --clobber
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.release_info.outputs.tag }}" "${{ env.PORTABLE_ZIP }}" --clobber
+
