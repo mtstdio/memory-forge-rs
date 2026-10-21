@@ -26,6 +26,7 @@ const PLATFORM_ITEMS = [
   { id: "kiro", labelKey: "platformKiro" as const, isPlatform: true },
   { id: "kiro-ide", labelKey: "platformKiroIde" as const, isPlatform: true },
   { id: "gemini", labelKey: "platformGemini" as const, isPlatform: true },
+  { id: "zcode", labelKey: "platformZcode" as const, isPlatform: true },
 ];
 
 const TERMINAL_OPTIONS = {
@@ -511,6 +512,13 @@ export default function SettingsPage() {
               onSave={(v) => updateSettings({ piHome: v || null })}
               pickMode="directory"
               value={snapshot.settings.piHome ?? ""}
+            />
+            <PathRow
+              defaultHint="~/.zcode"
+              label={t("zcodeHome")}
+              onSave={(v) => updateSettings({ zcodeHome: v || null })}
+              pickMode="directory"
+              value={snapshot.settings.zcodeHome ?? ""}
             />
           </div>
         </section>

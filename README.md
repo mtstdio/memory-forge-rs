@@ -46,7 +46,7 @@ You've spent 40 minutes guiding Claude Code through a complex refactor. It's goi
 
 A **local desktop app** that lets you browse, edit, and manage AI coding assistant sessions.
 
-Works with **Claude Code**, **Codex CLI**, **OpenCode**, **Kiro CLI**, **Kiro IDE**, and **Gemini CLI** — all in one unified interface.
+Works with **Claude Code**, **Codex CLI**, **OpenCode**, **Cursor**, **Kiro CLI**, **Kiro IDE**, **Gemini CLI**, and **ZCode** — all in one unified interface.
 
 Built with **Tauri v2 + Rust**. No Python, no server, no cloud. 100% local.
 
@@ -110,7 +110,7 @@ That's it. Your AI picks up the corrected memory on the next `--resume`.
 - **Edit Audit Log** — Every edit is tracked with before/after diff, fully traceable
 
 **Session Management**
-- **Multi-platform** — Claude Code / Codex CLI / OpenCode / Kiro CLI / Kiro IDE / Gemini CLI in one unified view
+- **Multi-platform** — Claude Code / Codex CLI / OpenCode / Cursor / Kiro CLI / Kiro IDE / Gemini CLI / ZCode in one unified view
 - **Dashboard** — Session stats across all platforms
 - **Favorites & Archive** — Star important sessions, soft-archive the rest
 - **Session Aliases** — Give sessions memorable names for quick lookup
@@ -132,8 +132,10 @@ That's it. Your AI picks up the corrected memory on the next `--resume`.
 | **Codex CLI** | `codex resume <id>` | — | `~/.codex` |
 | **OpenCode** | `opencode -s <id>` | `opencode -s <id> --fork` | `~/.local/share/opencode/opencode.db` |
 | **Kiro CLI** | `kiro-cli chat --resume-id <id>` | — | `~/.kiro` |
-| **Kiro IDE** | — | — | `%APPDATA%\Kiro\User\globalStorage\kiro.kiroagent` |
+| **Kiro IDE** | — | — | `~/.kiro/sessions` |
+| **Cursor** | — | — | `%APPDATA%\Cursor\User` |
 | **Gemini CLI** | `gemini --resume '<id>'` | — | `~/.gemini` |
+| **ZCode** | — | — | `~/.zcode` |
 
 ## Installation
 
@@ -261,7 +263,7 @@ Tech discussions & AI experience sharing at [LINUX DO](https://linux.do)
 
 一个**本地桌面应用**，让你浏览、编辑、管理 AI 编程助手的会话记录。
 
-支持 **Claude Code**、**Codex CLI**、**OpenCode**、**Kiro CLI**、**Kiro IDE** 和 **Gemini CLI** — 统一界面管理。
+支持 **Claude Code**、**Codex CLI**、**OpenCode**、**Cursor**、**Kiro CLI**、**Kiro IDE**、**Gemini CLI** 和 **ZCode** — 统一界面管理。
 
 **Tauri v2 + Rust** 构建。没有 Python，没有服务器，没有云端。100% 本地运行。
 
@@ -325,7 +327,7 @@ Tech discussions & AI experience sharing at [LINUX DO](https://linux.do)
 - **修改追溯** — 每次编辑都有前后 diff 对比，完整可追溯
 
 **会话管理**
-- **多平台统一** — Claude Code / Codex CLI / OpenCode / Kiro CLI / Kiro IDE / Gemini CLI 一个界面搞定
+- **多平台统一** — Claude Code / Codex CLI / OpenCode / Cursor / Kiro CLI / Kiro IDE / Gemini CLI / ZCode 一个界面搞定
 - **仪表盘** — 跨平台会话统计
 - **收藏 & 归档** — 星标重要会话，归档不常用的
 - **会话别名** — 给会话起容易记的名字
@@ -347,8 +349,10 @@ Tech discussions & AI experience sharing at [LINUX DO](https://linux.do)
 | **Codex CLI** | `codex resume <id>` | — | `~/.codex` |
 | **OpenCode** | `opencode -s <id>` | `opencode -s <id> --fork` | `~/.local/share/opencode/opencode.db` |
 | **Kiro CLI** | `kiro-cli chat --resume-id <id>` | — | `~/.kiro` |
-| **Kiro IDE** | — | — | `%APPDATA%\Kiro\User\globalStorage\kiro.kiroagent` |
+| **Kiro IDE** | — | — | `~/.kiro/sessions` |
+| **Cursor** | — | — | `%APPDATA%\Cursor\User` |
 | **Gemini CLI** | `gemini --resume '<id>'` | — | `~/.gemini` |
+| **ZCode** | — | — | `~/.zcode` |
 
 ## 安装方式
 

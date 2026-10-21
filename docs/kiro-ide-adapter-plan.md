@@ -236,3 +236,75 @@ pub kiro_ide_home: Option<String>,   // 默认: %APPDATA%\Kiro\User\globalStorag
 | 大文件性能 | 单个 JSON 文件可能很大（1.6MB+） | list 时只读 history[0]，detail 时全量读取 |
 | macOS/Linux 路径 | 未确认非 Windows 平台的数据路径 | 先实现 Windows，其他平台待测试 |
 | 工具调用消息 | content 可能包含 tool_use 等类型 | 只处理 `type: "text"`，其他类型跳过 |
+
+---
+
+## 八、2026-09 新版会话布局迁移（已实现）
+
+新版 Kiro IDE 改变了会话存储位置：不再写 `globalStorage/kiro.kiroagent/workspace-sessions/`，
+而是统一放到用户主目录的 `.kiro` 下。`globalStorage/kiro.kiroagent` 里只剩哈希命名的
+（基本为空的）执行日志目录和 `profile.json`。第一~七章描述的旧布局仍保留兼容扫描。
+
+### 8.1 新目录结构
+
+```
+~/.kiro\                                       # Windows: C:\Users\{user}\.kiro
+├── sessions\
+│   ├── {workspace_hash}\                      # 每个工作区一个文件夹（如 1807085860ef6468）
+│   │   └── sess_{uuid}\                       # 每个会话一个文件夹
+│   │       ├── session.json                   # 会话元数据
+│   │       ├── messages.jsonl                 # 会话消息流（JSONL，一行一个事件）
+│   │       └── snapshots\                     # 文件编辑快照
+│   ├── _global\                               # 无工作区会话
+│   └── cli\                                   # Kiro CLI 会话（归 platforms/kiro.rs 管，IDE 适配器跳过）
+└── session-index\
+    └── {workspace_hash}.jsonl                 # 索引操作日志 {"op":"add","sessionPath":...,"at":...}
+```
+
+注意：`workspace_hash` 是 Kiro 内部哈希，不是 Base64。工作区路径直接从 `session.json`
+的 `workspacePaths` 读取，无需反解哈希。`state.vscdb` 仍是 VSCode 框架状态库，与聊天记录无关。
+
+### 8.2 session.json 格式
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "id": "sess_6329c3e3-ecd6-40de-92b2-8b0d579136f3",
+  "title": "sanguo",
+  "agentMode": "vibe",
+  "workspacePaths": ["e:\\workspace"],
+  "rootPaths": ["e:\\workspace"],
+  "createdAt": "2026-09-30T05:29:05.836Z",
+  "lastModifiedAt": "2026-09-30T05:54:46.759Z",
+  "modelId": "claude-opus-5.5",
+  "autopilot": true
+}
+```
+
+### 8.3 messages.jsonl 事件类型
+
+| payload.type | 说明 | 适配器处理 |
+|--------------|------|-----------|
+| `user` | 用户消息，`content` 为字符串，含 `images`/`documents` | user 块 |
+| `assistant` | 助手消息，`operationType`: `Say`（正式回复）/ `Reasoning`（思考）/ `Summary` | `Say`/`Summary` → assistant 块；`Reasoning` 跳过 |
+| `tool_call` | 工具调用：`toolCallId`/`toolName`/`args`/`status`/`actionType` | 挂到本轮 assistant 块的 `toolCalls` |
+| `tool_result` | 工具结果：`toolCallId`/`content`/`success` | 与 `tool_call` 按 id 合并 |
+| `turn_start`/`turn_end` | 回合边界（`executionId`） | `turn_end` 时冲刷未认领的工具调用 |
+| `session_start` | 系统提示词（单行可能很大） | 跳过 |
+| `session_metadata` | `key`/`value` 状态（如 contextUsage） | 跳过 |
+| `usage_summary`/`session_event`/`pending_interaction`/`interaction_resolved`/`sub_agent_start`/`sub_agent_complete`/`tombstone`/`steering_inclusion` | 其他运行时事件 | 跳过 |
+
+消息内每行结构：`{"id", "timestamp", "payload": {...}}`。编辑按事件 `id` 定位
+（无 id 时回退 `line:<index>`），替换 `payload.content` 后整文件重写（保持紧凑 JSONL）。
+
+### 8.4 代码改动
+
+| 文件 | 改动 |
+|------|------|
+| `kiro_ide.rs` | `KiroIdePlatform::new(kiro_home, legacy_agent_home)`；新增新布局扫描/详情/编辑/搜索；工具调用合并逻辑（参照 claude.rs 的 pending → assistant 块模式）；旧版逻辑整体保留为回退 |
+| `platforms/mod.rs` | `"kiro-ide"` 分支传两个根：`settings.kiro_home`（默认 `~/.kiro`，与 Kiro CLI 共享）+ 旧版 `settings.kiro_ide_home`（默认 `%APPDATA%\Kiro\User\globalStorage\kiro.kiroagent`） |
+| `default_agent_home` → `default_legacy_agent_home` | 仅作为旧版回退路径 |
+
+会话 Key 两种布局统一为 `{workspace_key}::{session_id}`；新版 `session_id` 带 `sess_` 前缀，
+按目录是否存在（而非前缀）判定走哪个布局。列表合并两个布局后按 `updated_at` 排序分页。
+

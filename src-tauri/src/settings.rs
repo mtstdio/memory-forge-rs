@@ -43,6 +43,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub pi_home: Option<String>,
     #[serde(default)]
+    pub zcode_home: Option<String>,
+    #[serde(default)]
     pub preferred_terminal: Option<String>,
     #[serde(default = "default_visible_platforms")]
     pub visible_platforms: Vec<String>,
@@ -134,6 +136,7 @@ impl Default for AppSettings {
             gemini_home: None,
             grok_home: None,
             pi_home: None,
+            zcode_home: None,
             preferred_terminal: None,
             visible_platforms: default_visible_platforms(),
             navigation_items: Some(default_navigation_items(&default_visible_platforms())),
@@ -161,6 +164,7 @@ pub struct AppSettingsPatch {
     pub gemini_home: Option<Option<String>>,
     pub grok_home: Option<Option<String>>,
     pub pi_home: Option<Option<String>>,
+    pub zcode_home: Option<Option<String>>,
     pub preferred_terminal: Option<Option<String>>,
     pub visible_platforms: Option<Vec<String>>,
     pub navigation_items: Option<Vec<String>>,
@@ -303,6 +307,10 @@ pub fn update_settings(
 
     if let Some(pi_home) = patch.pi_home {
         settings.pi_home = pi_home.filter(|s| !s.trim().is_empty());
+    }
+
+    if let Some(zcode_home) = patch.zcode_home {
+        settings.zcode_home = zcode_home.filter(|s| !s.trim().is_empty());
     }
 
     if let Some(preferred_terminal) = patch.preferred_terminal {

@@ -18,6 +18,7 @@ import {
   SquareTerminal,
   Terminal,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { api } from "@/features/desktop/api";
@@ -55,6 +56,7 @@ const platformConfigs: Record<
   gemini: { label: "Gemini", icon: Gem, color: "text-rose-400", hoverColor: "group-hover:text-rose-300" },
   grok: { label: "Grok", icon: Orbit, color: "text-cyan-400", hoverColor: "group-hover:text-cyan-300" },
   pi: { label: "Pi", icon: PiIcon, color: "text-pink-400", hoverColor: "group-hover:text-pink-300" },
+  zcode: { label: "ZCode", icon: Zap, color: "text-teal-400", hoverColor: "group-hover:text-teal-300" },
 };
 
 function getPlatformConfig(platform: string | null) {

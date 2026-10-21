@@ -7,6 +7,7 @@ pub mod kiro;
 pub mod kiro_ide;
 pub mod opencode;
 pub mod pi;
+pub mod zcode;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -471,13 +472,22 @@ pub fn get_adapter(
             Ok(Box::new(kiro::KiroPlatform::new(path)))
         }
         "kiro-ide" => {
-            let path = settings
+            // New Kiro versions store sessions under `~/.kiro/sessions/<workspace>/sess_<id>/`.
+            let kiro_home = settings
+                .kiro_home
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".kiro"));
+            // Older versions keep sessions under `globalStorage/kiro.kiroagent/workspace-sessions/`.
+            let legacy_agent_home = settings
                 .kiro_ide_home
                 .as_ref()
                 .map(PathBuf::from)
-                .or_else(kiro_ide::default_agent_home)
-                .unwrap_or_else(|| home.join(".config/Kiro/User/globalStorage/kiro.kiroagent"));
-            Ok(Box::new(kiro_ide::KiroIdePlatform::new(path)))
+                .or_else(kiro_ide::default_legacy_agent_home);
+            Ok(Box::new(kiro_ide::KiroIdePlatform::new(
+                kiro_home,
+                legacy_agent_home,
+            )))
         }
         "gemini" => {
             let path = settings
@@ -505,6 +515,14 @@ pub fn get_adapter(
                 .unwrap_or_else(|| home.join(".pi").join("agent"));
             let sessions_root = pi::default_pi_sessions_root(&path);
             Ok(Box::new(pi::PiPlatform::new(path, sessions_root)))
+        }
+        "zcode" => {
+            let path = settings
+                .zcode_home
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".zcode"));
+            Ok(Box::new(zcode::ZcodePlatform::new(path)))
         }
         _ => Err(format!("Unknown platform: {platform}")),
     }
@@ -542,6 +560,7 @@ pub fn build_commands(platform: &str, session_id: &str) -> HashMap<String, Strin
             m
         }
         "kiro-ide" => HashMap::new(),
+        "zcode" => HashMap::new(),
         "gemini" => {
             let mut m = HashMap::new();
             m.insert("resume".into(), format!("gemini --resume '{session_id}'"));

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -8,8 +9,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
-    build_commands, extract_snippet, ContentMatch, PlatformAdapter, SessionDetail, SessionListItem,
-    SessionListResult, TimelineBlock,
+    build_commands, extract_snippet, tool_text_from_value, visit_bounded_jsonl_lines, ContentMatch,
+    PlatformAdapter, SessionDetail, SessionListItem, SessionListResult, TimelineBlock,
+    ToolCallBlock, MAX_INDEX_SOURCE_LINE_BYTES,
 };
 
 const EXECUTION_LOG_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -18,10 +20,28 @@ const EXECUTION_LOG_SCAN_MAX_MILLIS: u128 = 1_500;
 const EXECUTION_LOG_DEEP_SCAN_MAX_MILLIS: u128 = 20_000;
 const EXECUTION_LOG_SCAN_FALLBACK_MAX_FILES: usize = 256;
 
-pub struct KiroIdePlatform {
-    agent_home: PathBuf,
+const KIRO_TOOL_INPUT_MAX_CHARS: usize = 8192;
+const KIRO_TOOL_OUTPUT_MAX_CHARS: usize = 32768;
+
+/// New-layout session metadata (`~/.kiro/sessions/<workspace>/sess_<id>/session.json`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroSessionMeta {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    workspace_paths: Vec<String>,
+    #[serde(default)]
+    root_paths: Vec<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    last_modified_at: String,
 }
 
+/// Legacy-layout session index (`workspace-sessions/<workspace>/sessions.json`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct KiroIdeSessionIndex {
@@ -31,10 +51,157 @@ struct KiroIdeSessionIndex {
     workspace_directory: String,
 }
 
+pub struct KiroIdePlatform {
+    /// Kiro home for the new layout (`~/.kiro`); sessions live under `sessions/<workspace>/sess_<id>/`.
+    kiro_home: PathBuf,
+    /// Legacy agent home (`globalStorage/kiro.kiroagent`); sessions live under `workspace-sessions/`.
+    agent_home: PathBuf,
+    legacy_enabled: bool,
+}
+
 impl KiroIdePlatform {
-    pub fn new(agent_home: PathBuf) -> Self {
-        Self { agent_home }
+    pub fn new(kiro_home: PathBuf, legacy_agent_home: Option<PathBuf>) -> Self {
+        Self {
+            legacy_enabled: legacy_agent_home.is_some(),
+            agent_home: legacy_agent_home.unwrap_or_else(|| kiro_home.clone()),
+            kiro_home,
+        }
     }
+
+    // ------------------------------------------------------------------
+    // New layout (`~/.kiro/sessions/<workspace>/sess_<id>/`)
+    // ------------------------------------------------------------------
+
+    fn sessions_root(&self) -> PathBuf {
+        self.kiro_home.join("sessions")
+    }
+
+    fn new_session_dir(&self, workspace_key: &str, session_id: &str) -> PathBuf {
+        self.sessions_root().join(workspace_key).join(session_id)
+    }
+
+    fn new_layout_list_items(&self, alias_map: &HashMap<String, String>) -> Vec<SessionListItem> {
+        let mut items = Vec::new();
+        let Ok(workspaces) = fs::read_dir(self.sessions_root()) else {
+            return items;
+        };
+
+        for workspace in workspaces.flatten() {
+            let workspace_path = workspace.path();
+            if !workspace_path.is_dir() {
+                continue;
+            }
+            let workspace_key = match workspace_path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            // `sessions/cli` belongs to the Kiro CLI adapter (platforms/kiro.rs).
+            if workspace_key == "cli" {
+                continue;
+            }
+
+            let Ok(sessions) = fs::read_dir(&workspace_path) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let dir = session.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let Ok(meta) = read_new_session_meta(&dir.join("session.json")) else {
+                    continue;
+                };
+                let session_id = if meta.id.is_empty() {
+                    match dir.file_name().and_then(|n| n.to_str()) {
+                        Some(name) => name.to_string(),
+                        None => continue,
+                    }
+                } else {
+                    meta.id.clone()
+                };
+                let session_key = format!("{workspace_key}::{session_id}");
+                let alias = alias_map.get(&session_key).cloned().unwrap_or_default();
+                let display_title = if !alias.is_empty() {
+                    alias.clone()
+                } else if !meta.title.trim().is_empty() {
+                    meta.title.clone()
+                } else {
+                    session_id.clone()
+                };
+                let cwd = meta
+                    .workspace_paths
+                    .first()
+                    .or_else(|| meta.root_paths.first())
+                    .cloned()
+                    .unwrap_or_default();
+                let updated_at = if meta.last_modified_at.is_empty() {
+                    meta.created_at.clone()
+                } else {
+                    meta.last_modified_at
+                };
+
+                items.push(SessionListItem {
+                    platform: "kiro-ide".to_string(),
+                    session_key,
+                    session_id,
+                    display_title,
+                    alias_title: alias,
+                    preview: new_layout_preview(&dir.join("messages.jsonl")),
+                    updated_at,
+                    cwd,
+                    editable: true,
+                    content_matches: vec![],
+                    total_content_matches: 0,
+                    favorite: false,
+                    agent_group: None,
+                    profile: None,
+                });
+            }
+        }
+
+        items
+    }
+
+    fn new_layout_detail(
+        &self,
+        session_key: &str,
+        workspace_key: &str,
+        session_id: &str,
+        alias_map: &HashMap<String, String>,
+    ) -> Result<SessionDetail, String> {
+        let dir = self.new_session_dir(workspace_key, session_id);
+        let meta = read_new_session_meta(&dir.join("session.json"))?;
+        let alias = alias_map.get(session_key).cloned().unwrap_or_default();
+        let title = if !alias.is_empty() {
+            alias.clone()
+        } else if !meta.title.trim().is_empty() {
+            meta.title
+        } else {
+            session_id.to_string()
+        };
+        let cwd = meta
+            .workspace_paths
+            .first()
+            .or_else(|| meta.root_paths.first())
+            .cloned()
+            .unwrap_or_default();
+        let blocks = build_new_layout_blocks(session_key, &dir.join("messages.jsonl"));
+
+        Ok(SessionDetail {
+            platform: "kiro-ide".to_string(),
+            session_key: session_key.to_string(),
+            session_id: session_id.to_string(),
+            title,
+            alias_title: alias,
+            cwd,
+            commands: build_commands("kiro-ide", session_id),
+            blocks,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy layout (`globalStorage/kiro.kiroagent/workspace-sessions/`)
+    // ------------------------------------------------------------------
 
     fn workspace_sessions_dir(&self) -> PathBuf {
         self.agent_home.join("workspace-sessions")
@@ -82,6 +249,189 @@ impl KiroIdePlatform {
             .map_err(|e| format!("Failed to read Kiro IDE session '{}': {e}", path.display()))?;
         serde_json::from_str(&raw)
             .map_err(|e| format!("Failed to parse Kiro IDE session '{}': {e}", path.display()))
+    }
+
+    fn legacy_list_items(&self, alias_map: &HashMap<String, String>) -> Vec<SessionListItem> {
+        if !self.workspace_sessions_dir().exists() {
+            return Vec::new();
+        }
+
+        let mut items = Vec::new();
+        for workspace_key in self.collect_workspace_keys() {
+            for entry in self.read_index(&workspace_key) {
+                let session_key = format!("{workspace_key}::{}", entry.session_id);
+                let alias = alias_map.get(&session_key).cloned().unwrap_or_default();
+                let display_title = if alias.is_empty() {
+                    if entry.title.trim().is_empty() {
+                        entry.session_id.clone()
+                    } else {
+                        entry.title.clone()
+                    }
+                } else {
+                    alias.clone()
+                };
+
+                items.push(SessionListItem {
+                    platform: "kiro-ide".to_string(),
+                    session_key,
+                    session_id: entry.session_id.clone(),
+                    display_title,
+                    alias_title: alias,
+                    preview: self.legacy_preview(&workspace_key, &entry.session_id),
+                    updated_at: entry.date_created,
+                    cwd: entry.workspace_directory,
+                    editable: true,
+                    content_matches: vec![],
+                    total_content_matches: 0,
+                    favorite: false,
+                    agent_group: None,
+                    profile: None,
+                });
+            }
+        }
+        items
+    }
+
+    fn legacy_preview(&self, workspace_key: &str, session_id: &str) -> String {
+        let Ok(session) = self.read_session_json(workspace_key, session_id) else {
+            return String::new();
+        };
+
+        session
+            .get("history")
+            .and_then(Value::as_array)
+            .and_then(|history| {
+                history.iter().find_map(|entry| {
+                    let content = entry.get("message")?.get("content")?;
+                    let text = extract_message_text(content);
+                    if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(truncate(&text, 120))
+                    }
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    fn legacy_detail(
+        &self,
+        session_key: &str,
+        workspace_key: &str,
+        session_id: &str,
+        alias_map: &HashMap<String, String>,
+    ) -> Result<SessionDetail, String> {
+        let session = self.read_session_json(workspace_key, session_id)?;
+        let index = self
+            .read_index(workspace_key)
+            .into_iter()
+            .find(|entry| entry.session_id == session_id);
+        let alias = alias_map.get(session_key).cloned().unwrap_or_default();
+        let title_raw = index
+            .as_ref()
+            .map(|entry| entry.title.as_str())
+            .unwrap_or(session_id);
+        let title = if alias.is_empty() {
+            if title_raw.trim().is_empty() {
+                session_id.to_string()
+            } else {
+                title_raw.to_string()
+            }
+        } else {
+            alias.clone()
+        };
+        let cwd = index
+            .as_ref()
+            .map(|entry| entry.workspace_directory.clone())
+            .unwrap_or_default();
+
+        let history = session.get("history").and_then(Value::as_array);
+        let execution_ids: HashSet<String> = history
+            .map(|history| {
+                history
+                    .iter()
+                    .filter_map(|entry| {
+                        let message = entry.get("message")?;
+                        let role = message.get("role").and_then(Value::as_str)?;
+                        if role != "assistant" {
+                            return None;
+                        }
+                        let content = extract_message_text(message.get("content")?);
+                        if content.trim() != "On it." {
+                            return None;
+                        }
+                        entry
+                            .get("executionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let execution_outputs = self.execution_outputs(Some(&cwd), session_id, &execution_ids);
+
+        let blocks: Vec<TimelineBlock> = history
+            .map(|history| {
+                history
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| {
+                        let message = entry.get("message")?;
+                        let role = message.get("role").and_then(Value::as_str)?;
+                        if role != "user" && role != "assistant" {
+                            return None;
+                        }
+                        let message_id = message.get("id").and_then(Value::as_str).unwrap_or("");
+                        if message_id.is_empty() {
+                            return None;
+                        }
+                        let mut content = extract_message_text(message.get("content")?);
+                        let execution_id = entry.get("executionId").and_then(Value::as_str);
+                        if role == "assistant" && content.trim() == "On it." {
+                            if let Some(execution_id) = execution_id {
+                                if let Some(output) = execution_outputs.get(execution_id) {
+                                    content = output.clone();
+                                }
+                            }
+                        }
+                        Some(TimelineBlock {
+                            id: message_id.to_string(),
+                            role: role.to_string(),
+                            content,
+                            editable: true,
+                            edit_target: if role == "assistant" {
+                                if let Some(execution_id) = execution_id {
+                                    format!(
+                                        "{session_key}::{message_id}::execution::{execution_id}"
+                                    )
+                                } else {
+                                    format!("{session_key}::{message_id}")
+                                }
+                            } else {
+                                format!("{session_key}::{message_id}")
+                            },
+                            source_meta: json!({
+                                "historyIndex": index,
+                                "messageId": message_id,
+                                "executionId": execution_id,
+                            }),
+                            tool_calls: Vec::new(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(SessionDetail {
+            platform: "kiro-ide".to_string(),
+            session_key: session_key.to_string(),
+            session_id: session_id.to_string(),
+            title,
+            alias_title: alias,
+            cwd,
+            commands: build_commands("kiro-ide", session_id),
+            blocks,
+        })
     }
 
     fn execution_log_files(&self, workspace_dir: Option<&str>) -> Vec<PathBuf> {
@@ -212,7 +562,8 @@ impl KiroIdePlatform {
 
             collect_execution_aliases(&parsed, execution_ids, &mut alias_outputs, &mut target_ids);
 
-            for (execution_id, output) in extract_execution_outputs_from_log(&parsed, &target_ids) {
+            for (execution_id, output) in extract_execution_outputs_from_log(&parsed, &target_ids)
+            {
                 insert_longer_owned_output(&mut raw_outputs, execution_id, output);
             }
         }
@@ -512,27 +863,6 @@ impl KiroIdePlatform {
         );
         Ok(old_content)
     }
-    fn preview(&self, workspace_key: &str, session_id: &str) -> String {
-        let Ok(session) = self.read_session_json(workspace_key, session_id) else {
-            return String::new();
-        };
-
-        session
-            .get("history")
-            .and_then(Value::as_array)
-            .and_then(|history| {
-                history.iter().find_map(|entry| {
-                    let content = entry.get("message")?.get("content")?;
-                    let text = extract_message_text(content);
-                    if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(truncate(&text, 120))
-                    }
-                })
-            })
-            .unwrap_or_default()
-    }
 
     fn parse_session_key(session_key: &str) -> Option<(&str, &str)> {
         let mut parts = session_key.splitn(2, "::");
@@ -552,45 +882,9 @@ impl PlatformAdapter for KiroIdePlatform {
         limit: Option<usize>,
         offset: usize,
     ) -> SessionListResult {
-        if !self.workspace_sessions_dir().exists() {
-            return SessionListResult {
-                total: 0,
-                items: Vec::new(),
-            };
-        }
-
-        let mut items = Vec::new();
-        for workspace_key in self.collect_workspace_keys() {
-            for entry in self.read_index(&workspace_key) {
-                let session_key = format!("{workspace_key}::{}", entry.session_id);
-                let alias = alias_map.get(&session_key).cloned().unwrap_or_default();
-                let display_title = if alias.is_empty() {
-                    if entry.title.trim().is_empty() {
-                        entry.session_id.clone()
-                    } else {
-                        entry.title.clone()
-                    }
-                } else {
-                    alias.clone()
-                };
-
-                items.push(SessionListItem {
-                    platform: "kiro-ide".to_string(),
-                    session_key,
-                    session_id: entry.session_id.clone(),
-                    display_title,
-                    alias_title: alias,
-                    preview: self.preview(&workspace_key, &entry.session_id),
-                    updated_at: entry.date_created,
-                    cwd: entry.workspace_directory,
-                    editable: true,
-                    content_matches: vec![],
-                    total_content_matches: 0,
-                    favorite: false,
-                    agent_group: None,
-                    profile: None,
-                });
-            }
+        let mut items = self.new_layout_list_items(alias_map);
+        if self.legacy_enabled {
+            items.extend(self.legacy_list_items(alias_map));
         }
 
         items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -608,132 +902,25 @@ impl PlatformAdapter for KiroIdePlatform {
         session_key: &str,
         alias_map: &HashMap<String, String>,
     ) -> Result<SessionDetail, String> {
-        let t0 = Instant::now();
         let (workspace_key, session_id) = Self::parse_session_key(session_key)
             .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
-        let session = self.read_session_json(workspace_key, session_id)?;
-        let index = self
-            .read_index(workspace_key)
-            .into_iter()
-            .find(|entry| entry.session_id == session_id);
-        let alias = alias_map.get(session_key).cloned().unwrap_or_default();
-        let title_raw = index
-            .as_ref()
-            .map(|entry| entry.title.as_str())
-            .unwrap_or(session_id);
-        let title = if alias.is_empty() {
-            if title_raw.trim().is_empty() {
-                session_id.to_string()
-            } else {
-                title_raw.to_string()
-            }
-        } else {
-            alias.clone()
-        };
-        let cwd = index
-            .as_ref()
-            .map(|entry| entry.workspace_directory.clone())
-            .unwrap_or_default();
 
-        let history = session.get("history").and_then(Value::as_array);
-        let execution_ids: HashSet<String> = history
-            .map(|history| {
-                history
-                    .iter()
-                    .filter_map(|entry| {
-                        let message = entry.get("message")?;
-                        let role = message.get("role").and_then(Value::as_str)?;
-                        if role != "assistant" {
-                            return None;
-                        }
-                        let content = extract_message_text(message.get("content")?);
-                        if content.trim() != "On it." {
-                            return None;
-                        }
-                        entry
-                            .get("executionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let execution_outputs = self.execution_outputs(Some(&cwd), session_id, &execution_ids);
-
-        let blocks: Vec<TimelineBlock> = history
-            .map(|history| {
-                history
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| {
-                        let message = entry.get("message")?;
-                        let role = message.get("role").and_then(Value::as_str)?;
-                        if role != "user" && role != "assistant" {
-                            return None;
-                        }
-                        let message_id = message.get("id").and_then(Value::as_str).unwrap_or("");
-                        if message_id.is_empty() {
-                            return None;
-                        }
-                        let mut content = extract_message_text(message.get("content")?);
-                        let execution_id = entry.get("executionId").and_then(Value::as_str);
-                        if role == "assistant" && content.trim() == "On it." {
-                            if let Some(execution_id) = execution_id {
-                                if let Some(output) = execution_outputs.get(execution_id) {
-                                    content = output.clone();
-                                }
-                            }
-                        }
-                        Some(TimelineBlock {
-                            id: message_id.to_string(),
-                            role: role.to_string(),
-                            content,
-                            editable: true,
-                            edit_target: if role == "assistant" {
-                                if let Some(execution_id) = execution_id {
-                                    format!(
-                                        "{session_key}::{message_id}::execution::{execution_id}"
-                                    )
-                                } else {
-                                    format!("{session_key}::{message_id}")
-                                }
-                            } else {
-                                format!("{session_key}::{message_id}")
-                            },
-                            source_meta: json!({
-                                "historyIndex": index,
-                                "messageId": message_id,
-                                "executionId": execution_id,
-                            }),
-                            tool_calls: Vec::new(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        eprintln!(
-            "[perf] kiro-ide get_session_detail build session={session_id} blocks={}: {:?}",
-            blocks.len(),
-            t0.elapsed()
-        );
-
-        Ok(SessionDetail {
-            platform: "kiro-ide".to_string(),
-            session_key: session_key.to_string(),
-            session_id: session_id.to_string(),
-            title,
-            alias_title: alias,
-            cwd,
-            commands: build_commands("kiro-ide", session_id),
-            blocks,
-        })
+        if self.new_session_dir(workspace_key, session_id).is_dir() {
+            return self.new_layout_detail(session_key, workspace_key, session_id, alias_map);
+        }
+        if self.legacy_enabled {
+            return self.legacy_detail(session_key, workspace_key, session_id, alias_map);
+        }
+        Err(format!("Kiro IDE session not found: {session_key}"))
     }
 
     fn update_message(&self, edit_target: &str, new_content: &str) -> Result<String, String> {
         if let Some((session_key, _message_id, execution_id)) =
             parse_execution_edit_target(edit_target)
         {
+            if !self.legacy_enabled {
+                return Err("Execution output editing requires the legacy Kiro IDE store".to_string());
+            }
             let (workspace_key, session_id) = Self::parse_session_key(session_key)
                 .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
             let workspace_dir = self
@@ -750,7 +937,7 @@ impl PlatformAdapter for KiroIdePlatform {
         }
 
         let mut parts = edit_target.rsplitn(2, "::");
-        let message_id = parts
+        let message_ref = parts
             .next()
             .ok_or_else(|| format!("Invalid edit target: {edit_target}"))?;
         let session_key = parts
@@ -758,6 +945,16 @@ impl PlatformAdapter for KiroIdePlatform {
             .ok_or_else(|| format!("Invalid edit target: {edit_target}"))?;
         let (workspace_key, session_id) = Self::parse_session_key(session_key)
             .ok_or_else(|| format!("Invalid Kiro IDE session key: {session_key}"))?;
+
+        let new_dir = self.new_session_dir(workspace_key, session_id);
+        if new_dir.is_dir() {
+            return update_new_layout_message(&new_dir.join("messages.jsonl"), message_ref, new_content);
+        }
+
+        if !self.legacy_enabled {
+            return Err(format!("Kiro IDE session not found: {session_key}"));
+        }
+
         let path = self.session_path(workspace_key, session_id);
         let mut session = self.read_session_json(workspace_key, session_id)?;
         let history = session
@@ -769,7 +966,7 @@ impl PlatformAdapter for KiroIdePlatform {
             let Some(message) = entry.get_mut("message") else {
                 continue;
             };
-            if message.get("id").and_then(Value::as_str) != Some(message_id) {
+            if message.get("id").and_then(Value::as_str) != Some(message_ref) {
                 continue;
             }
             let content = message
@@ -782,7 +979,7 @@ impl PlatformAdapter for KiroIdePlatform {
             return Ok(old);
         }
 
-        Err(format!("Message not found: {message_id}"))
+        Err(format!("Message not found: {message_ref}"))
     }
 
     fn matches_query(&self, session_key: &str, query: &str) -> bool {
@@ -797,6 +994,15 @@ impl PlatformAdapter for KiroIdePlatform {
         let Some((workspace_key, session_id)) = Self::parse_session_key(session_key) else {
             return vec![];
         };
+
+        let new_dir = self.new_session_dir(workspace_key, session_id);
+        if new_dir.is_dir() {
+            return new_layout_content_search(&new_dir.join("messages.jsonl"), &needle);
+        }
+
+        if !self.legacy_enabled {
+            return vec![];
+        }
         let Ok(session) = self.read_session_json(workspace_key, session_id) else {
             return vec![];
         };
@@ -835,6 +1041,9 @@ impl PlatformAdapter for KiroIdePlatform {
         session_key: &str,
         edit_target: &str,
     ) -> Result<String, String> {
+        if !self.legacy_enabled {
+            return Err("Execution output loading requires the legacy Kiro IDE store".to_string());
+        }
         self.resolve_execution_output_inner(session_key, edit_target)
     }
 
@@ -843,10 +1052,416 @@ impl PlatformAdapter for KiroIdePlatform {
         session_key: &str,
         edit_targets: &[String],
     ) -> Result<HashMap<String, String>, String> {
+        if !self.legacy_enabled {
+            return Err("Execution output loading requires the legacy Kiro IDE store".to_string());
+        }
         self.resolve_execution_outputs_inner(session_key, edit_targets)
     }
 }
 
+// ----------------------------------------------------------------------
+// New layout helpers
+// ----------------------------------------------------------------------
+
+fn read_new_session_meta(path: &Path) -> Result<KiroSessionMeta, String> {
+    let raw = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "Failed to read Kiro session meta '{}': {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse Kiro session meta '{}': {e}", path.display()))
+}
+
+/// First user message of a `messages.jsonl`, used as the list preview.
+fn new_layout_preview(path: &Path) -> String {
+    let mut preview = String::new();
+    let _ = visit_bounded_jsonl_lines(path, MAX_INDEX_SOURCE_LINE_BYTES, |line| {
+        let Ok(event) = serde_json::from_str::<Value>(std::str::from_utf8(line).unwrap_or(""))
+        else {
+            return true;
+        };
+        if event.pointer("/payload/type").and_then(Value::as_str) == Some("user") {
+            let content = event
+                .pointer("/payload/content")
+                .map(extract_message_text)
+                .unwrap_or_default();
+            if !content.trim().is_empty() {
+                preview = truncate(&content, 120);
+                return false;
+            }
+        }
+        true
+    });
+    preview
+}
+
+/// Build timeline blocks from the new-layout `messages.jsonl` event stream.
+///
+/// `user` events become user blocks; `assistant` events with operationType
+/// `Say`/`Summary` become assistant blocks (Reasoning is internal thought
+/// process and is skipped); `tool_call`/`tool_result` pairs attach to the
+/// assistant answer of their turn, falling back to a synthetic block.
+fn build_new_layout_blocks(session_key: &str, path: &Path) -> Vec<TimelineBlock> {
+    let mut blocks: Vec<TimelineBlock> = Vec::new();
+    let mut pending: Vec<ToolCallBlock> = Vec::new();
+    let Ok(file) = File::open(path) else {
+        return blocks;
+    };
+
+    for (line_index, line) in BufReader::new(file).lines().map_while(Result::ok).enumerate() {
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let event_id = event.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let timestamp = event
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let (block_id, edit_ref) = if event_id.is_empty() {
+            (format!("line-{line_index}"), format!("line:{line_index}"))
+        } else {
+            (event_id.clone(), event_id.clone())
+        };
+
+        match event_type {
+            "user" => {
+                let content = payload
+                    .get("content")
+                    .map(extract_message_text)
+                    .unwrap_or_default();
+                if content.trim().is_empty() {
+                    continue;
+                }
+                flush_pending_tool_calls(&mut blocks, &mut pending);
+                blocks.push(TimelineBlock {
+                    id: block_id,
+                    role: "user".to_string(),
+                    content,
+                    editable: true,
+                    edit_target: format!("{session_key}::{edit_ref}"),
+                    source_meta: json!({
+                        "lineIndex": line_index,
+                        "timestamp": timestamp,
+                    }),
+                    tool_calls: Vec::new(),
+                });
+            }
+            "assistant" => {
+                let operation = payload
+                    .get("operationType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Say");
+                if operation != "Say" && operation != "Summary" {
+                    continue;
+                }
+                let content = payload
+                    .get("content")
+                    .map(extract_message_text)
+                    .unwrap_or_default();
+                let mut block = TimelineBlock {
+                    id: block_id,
+                    role: "assistant".to_string(),
+                    content,
+                    editable: true,
+                    edit_target: format!("{session_key}::{edit_ref}"),
+                    source_meta: json!({
+                        "lineIndex": line_index,
+                        "timestamp": timestamp,
+                        "operationType": operation,
+                    }),
+                    tool_calls: Vec::new(),
+                };
+                append_or_merge_tool_calls(&mut block.tool_calls, &mut pending);
+                if block.content.trim().is_empty() && block.tool_calls.is_empty() {
+                    continue;
+                }
+                blocks.push(block);
+            }
+            "tool_call" => {
+                let Some(tool_call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let kind = payload
+                    .get("actionType")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("kind").and_then(Value::as_str))
+                    .unwrap_or("tool")
+                    .to_string();
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("requested")
+                    .to_string();
+                let input = payload
+                    .get("args")
+                    .and_then(|args| tool_text_from_value(args, KIRO_TOOL_INPUT_MAX_CHARS));
+                let tool_call = ToolCallBlock {
+                    id: tool_call_id.to_string(),
+                    name,
+                    kind,
+                    status,
+                    input,
+                    output: None,
+                    error: None,
+                    started_at: if timestamp.is_empty() {
+                        None
+                    } else {
+                        Some(timestamp.clone())
+                    },
+                    ended_at: None,
+                    source_meta: json!({
+                        "lineIndex": line_index,
+                        "eventType": "tool_call",
+                        "toolCallId": tool_call_id,
+                    }),
+                };
+                push_or_merge_tool_call(&mut pending, tool_call);
+            }
+            "tool_result" => {
+                let Some(tool_call_id) = payload.get("toolCallId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let success = payload.get("success").and_then(Value::as_bool).unwrap_or(true);
+                let text = payload
+                    .get("content")
+                    .and_then(|content| tool_text_from_value(content, KIRO_TOOL_OUTPUT_MAX_CHARS));
+                let tool_call = ToolCallBlock {
+                    id: tool_call_id.to_string(),
+                    name: "tool_result".to_string(),
+                    kind: "tool_result".to_string(),
+                    status: if success { "completed" } else { "error" }.to_string(),
+                    input: None,
+                    output: if success { text.clone() } else { None },
+                    error: if success { None } else { text },
+                    started_at: None,
+                    ended_at: if timestamp.is_empty() {
+                        None
+                    } else {
+                        Some(timestamp.clone())
+                    },
+                    source_meta: json!({
+                        "lineIndex": line_index,
+                        "eventType": "tool_result",
+                        "toolCallId": tool_call_id,
+                    }),
+                };
+                if !merge_tool_call_into_blocks(&mut blocks, &tool_call) {
+                    push_or_merge_tool_call(&mut pending, tool_call);
+                }
+            }
+            "turn_end" => flush_pending_tool_calls(&mut blocks, &mut pending),
+            _ => {}
+        }
+    }
+
+    flush_pending_tool_calls(&mut blocks, &mut pending);
+    blocks
+}
+
+/// Replace the content of one event in the new-layout `messages.jsonl`.
+///
+/// `event_ref` is either an event id or `line:<index>` for events without an id.
+fn update_new_layout_message(
+    path: &Path,
+    event_ref: &str,
+    new_content: &str,
+) -> Result<String, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read Kiro messages '{}': {e}", path.display()))?;
+    let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+
+    if let Some(index_part) = event_ref.strip_prefix("line:") {
+        let line_index: usize = index_part
+            .parse()
+            .map_err(|e| format!("Invalid line index '{event_ref}': {e}"))?;
+        let Some(line) = lines.get_mut(line_index) else {
+            return Err("Line index out of range".to_string());
+        };
+        let old = replace_new_layout_line_content(line, new_content)?;
+        fs::write(path, format!("{}\n", lines.join("\n")))
+            .map_err(|e| format!("Write error: {e}"))?;
+        return Ok(old);
+    }
+
+    for line in &mut lines {
+        let Ok(parsed) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if parsed.get("id").and_then(Value::as_str) != Some(event_ref) {
+            continue;
+        }
+        let event_type = parsed
+            .pointer("/payload/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if event_type != "user" && event_type != "assistant" {
+            return Err(format!("Event '{event_ref}' is not an editable message"));
+        }
+        let old = replace_new_layout_line_content(line, new_content)?;
+        fs::write(path, format!("{}\n", lines.join("\n")))
+            .map_err(|e| format!("Write error: {e}"))?;
+        return Ok(old);
+    }
+
+    Err(format!("Message not found: {event_ref}"))
+}
+
+fn replace_new_layout_line_content(line: &mut String, new_content: &str) -> Result<String, String> {
+    let mut parsed: Value = serde_json::from_str(line)
+        .map_err(|e| format!("Failed to parse Kiro message line: {e}"))?;
+    let Some(content) = parsed
+        .get_mut("payload")
+        .and_then(|payload| payload.get_mut("content"))
+    else {
+        return Err("Missing message content".to_string());
+    };
+    let old = replace_message_text(content, new_content)?;
+    *line = serde_json::to_string(&parsed).map_err(|e| format!("Serialize error: {e}"))?;
+    Ok(old)
+}
+
+fn new_layout_content_search(path: &Path, needle: &str) -> Vec<ContentMatch> {
+    let mut matches = Vec::new();
+    let mut msg_index = 0usize;
+    let _ = visit_bounded_jsonl_lines(path, MAX_INDEX_SOURCE_LINE_BYTES, |line| {
+        let Ok(event) = serde_json::from_str::<Value>(std::str::from_utf8(line).unwrap_or(""))
+        else {
+            return true;
+        };
+        let Some(payload) = event.get("payload") else {
+            return true;
+        };
+        let role = match payload.get("type").and_then(Value::as_str).unwrap_or("") {
+            "user" => "user",
+            "assistant" => {
+                let operation = payload
+                    .get("operationType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Say");
+                if operation != "Say" && operation != "Summary" {
+                    return true;
+                }
+                "assistant"
+            }
+            _ => return true,
+        };
+        let text = payload
+            .get("content")
+            .map(extract_message_text)
+            .unwrap_or_default();
+        if text.to_lowercase().contains(needle) {
+            matches.push(ContentMatch {
+                snippet: extract_snippet(&text, needle),
+                match_index: msg_index,
+                role: role.to_string(),
+            });
+        }
+        msg_index += 1;
+        true
+    });
+    matches
+}
+
+fn flush_pending_tool_calls(blocks: &mut Vec<TimelineBlock>, pending: &mut Vec<ToolCallBlock>) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let first_line_index = pending
+        .iter()
+        .find_map(|tool_call| tool_call.source_meta.get("lineIndex").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let mut block = TimelineBlock {
+        id: format!("tools-{first_line_index}"),
+        role: "assistant".to_string(),
+        content: String::new(),
+        editable: false,
+        edit_target: String::new(),
+        source_meta: json!({
+            "lineIndex": first_line_index,
+            "itemType": "tool_calls",
+        }),
+        tool_calls: Vec::new(),
+    };
+    append_or_merge_tool_calls(&mut block.tool_calls, pending);
+    blocks.push(block);
+}
+
+fn append_or_merge_tool_calls(target: &mut Vec<ToolCallBlock>, pending: &mut Vec<ToolCallBlock>) {
+    for tool_call in pending.drain(..) {
+        push_or_merge_tool_call(target, tool_call);
+    }
+}
+
+fn push_or_merge_tool_call(target: &mut Vec<ToolCallBlock>, tool_call: ToolCallBlock) {
+    if let Some(existing) = target
+        .iter_mut()
+        .find(|existing| existing.id == tool_call.id)
+    {
+        merge_tool_call(existing, tool_call);
+    } else {
+        target.push(tool_call);
+    }
+}
+
+fn merge_tool_call_into_blocks(blocks: &mut [TimelineBlock], tool_call: &ToolCallBlock) -> bool {
+    for block in blocks
+        .iter_mut()
+        .rev()
+        .filter(|block| block.role == "assistant")
+    {
+        if let Some(existing) = block
+            .tool_calls
+            .iter_mut()
+            .find(|existing| existing.id == tool_call.id)
+        {
+            merge_tool_call(existing, tool_call.clone());
+            return true;
+        }
+    }
+    false
+}
+
+fn merge_tool_call(existing: &mut ToolCallBlock, incoming: ToolCallBlock) {
+    if incoming.input.is_some() {
+        existing.input = incoming.input;
+    }
+    if incoming.output.is_some() {
+        existing.output = incoming.output;
+    }
+    if incoming.error.is_some() {
+        existing.error = incoming.error;
+    }
+    if incoming.started_at.is_some() {
+        existing.started_at = incoming.started_at;
+    }
+    if incoming.ended_at.is_some() {
+        existing.ended_at = incoming.ended_at;
+    }
+    if existing.error.is_some() {
+        existing.status = "error".to_string();
+    } else if existing.output.is_some() {
+        existing.status = "completed".to_string();
+    }
+}
+
+// ----------------------------------------------------------------------
+// Shared helpers
+// ----------------------------------------------------------------------
+
+/// Extract text from string or `[{type: "text", text}]` array content.
 fn extract_message_text(content: &Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();
@@ -1405,7 +2020,9 @@ fn truncate(text: &str, max_chars: usize) -> String {
     result
 }
 
-pub fn default_agent_home() -> Option<PathBuf> {
+/// Legacy agent home (`globalStorage/kiro.kiroagent`) for Kiro versions that
+/// predate the `~/.kiro/sessions` layout.
+pub fn default_legacy_agent_home() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA").map(PathBuf::from).map(|path| {
@@ -1432,6 +2049,24 @@ pub fn default_agent_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::var_os("MEMORY_FORGE_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("memory-forge-kiro-ide-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        root
+    }
+
+    fn write_messages_jsonl(path: &Path, events: &[Value]) {
+        let body = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize event"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{body}\n")).expect("write messages.jsonl");
+    }
 
     #[test]
     fn extracts_text_from_string_and_array_content() {
@@ -1637,5 +2272,216 @@ mod tests {
             outputs.get("exec-1").map(String::as_str),
             Some("An unexpected error occurred, please retry.")
         );
+    }
+
+    #[test]
+    fn parses_new_layout_session_meta_camel_case() {
+        let meta: KiroSessionMeta = serde_json::from_str(
+            &json!({
+                "id": "sess_6329c3e3",
+                "title": "sanguo",
+                "workspacePaths": ["e:\\workspace"],
+                "createdAt": "2026-09-30T05:29:05.836Z",
+                "lastModifiedAt": "2026-09-30T05:54:46.759Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(meta.id, "sess_6329c3e3");
+        assert_eq!(meta.title, "sanguo");
+        assert_eq!(meta.workspace_paths, vec!["e:\\workspace"]);
+        assert_eq!(meta.last_modified_at, "2026-09-30T05:54:46.759Z");
+
+        let empty: KiroSessionMeta = serde_json::from_str("{}").unwrap();
+        assert!(empty.id.is_empty());
+        assert!(empty.workspace_paths.is_empty());
+    }
+
+    #[test]
+    fn builds_new_layout_blocks_with_tool_calls_and_skips_reasoning() {
+        let root = test_root("blocks");
+        let path = root.join("messages.jsonl");
+        write_messages_jsonl(
+            &path,
+            &[
+                json!({
+                    "id": "u1",
+                    "timestamp": "2026-09-30T05:29:45.120Z",
+                    "payload": { "type": "user", "content": "你好" }
+                }),
+                json!({
+                    "id": "t1-turn-start",
+                    "payload": { "type": "turn_start", "executionId": "e1" }
+                }),
+                json!({
+                    "id": "tc1-call",
+                    "timestamp": "2026-09-30T05:29:52.456Z",
+                    "payload": {
+                        "type": "tool_call",
+                        "toolCallId": "tc1",
+                        "toolName": "read_files",
+                        "args": { "paths": ["a.rs"] },
+                        "status": "approved",
+                        "actionType": "read",
+                        "executionId": "e1"
+                    }
+                }),
+                json!({
+                    "id": "tc1-result",
+                    "timestamp": "2026-09-30T05:29:52.900Z",
+                    "payload": {
+                        "type": "tool_result",
+                        "toolCallId": "tc1",
+                        "content": "file body",
+                        "success": true,
+                        "executionId": "e1"
+                    }
+                }),
+                json!({
+                    "id": "r1-say",
+                    "payload": {
+                        "type": "assistant",
+                        "content": "thinking...",
+                        "operationType": "Reasoning",
+                        "executionId": "e1"
+                    }
+                }),
+                json!({
+                    "id": "a1-say",
+                    "timestamp": "2026-09-30T05:36:02.758Z",
+                    "payload": {
+                        "type": "assistant",
+                        "content": "answer text",
+                        "operationType": "Say",
+                        "executionId": "e1"
+                    }
+                }),
+                json!({
+                    "id": "t1-turn-end",
+                    "payload": { "type": "turn_end", "stopReason": "end_turn", "executionId": "e1" }
+                }),
+            ],
+        );
+
+        let blocks = build_new_layout_blocks("ws::sess_x", &path);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(blocks.len(), 2, "reasoning must be skipped: {blocks:?}");
+        assert_eq!(blocks[0].role, "user");
+        assert_eq!(blocks[0].content, "你好");
+        assert_eq!(blocks[0].edit_target, "ws::sess_x::u1");
+
+        assert_eq!(blocks[1].role, "assistant");
+        assert_eq!(blocks[1].content, "answer text");
+        assert_eq!(blocks[1].edit_target, "ws::sess_x::a1-say");
+        assert_eq!(blocks[1].tool_calls.len(), 1);
+        assert_eq!(blocks[1].tool_calls[0].name, "read_files");
+        assert_eq!(blocks[1].tool_calls[0].output.as_deref(), Some("file body"));
+        assert_eq!(blocks[1].tool_calls[0].status, "completed");
+    }
+
+    #[test]
+    fn flushes_unclaimed_tool_calls_into_synthetic_block() {
+        let root = test_root("flush");
+        let path = root.join("messages.jsonl");
+        write_messages_jsonl(
+            &path,
+            &[
+                json!({
+                    "id": "u1",
+                    "payload": { "type": "user", "content": "hi" }
+                }),
+                json!({
+                    "id": "tc2-call",
+                    "payload": {
+                        "type": "tool_call",
+                        "toolCallId": "tc2",
+                        "toolName": "execute_pwsh",
+                        "args": { "command": "ls" },
+                        "status": "approved"
+                    }
+                }),
+                json!({
+                    "id": "tc2-result",
+                    "payload": {
+                        "type": "tool_result",
+                        "toolCallId": "tc2",
+                        "content": "boom",
+                        "success": false
+                    }
+                }),
+                json!({
+                    "id": "t1-turn-end",
+                    "payload": { "type": "turn_end", "stopReason": "end_turn" }
+                }),
+            ],
+        );
+
+        let blocks = build_new_layout_blocks("ws::sess_x", &path);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(blocks.len(), 2, "unexpected blocks: {blocks:?}");
+        assert_eq!(blocks[0].role, "user");
+        assert_eq!(blocks[1].role, "assistant");
+        assert_eq!(blocks[1].content, "");
+        assert!(!blocks[1].editable);
+        assert_eq!(blocks[1].tool_calls.len(), 1);
+        assert_eq!(blocks[1].tool_calls[0].name, "execute_pwsh");
+        assert_eq!(blocks[1].tool_calls[0].error.as_deref(), Some("boom"));
+        assert_eq!(blocks[1].tool_calls[0].status, "error");
+    }
+
+    #[test]
+    fn updates_new_layout_message_by_event_id() {
+        let root = test_root("update");
+        let path = root.join("messages.jsonl");
+        write_messages_jsonl(
+            &path,
+            &[
+                json!({
+                    "id": "u1",
+                    "payload": { "type": "user", "content": "old-user" }
+                }),
+                json!({
+                    "id": "a1-say",
+                    "payload": { "type": "assistant", "content": "old-answer", "operationType": "Say" }
+                }),
+            ],
+        );
+
+        let old = update_new_layout_message(&path, "a1-say", "new-answer").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(old, "old-answer");
+        let lines: Vec<&str> = updated.lines().collect();
+        assert_eq!(lines.len(), 2, "jsonl must stay one event per line");
+        assert!(lines[0].contains("old-user"));
+        assert!(lines[1].contains("new-answer"));
+        assert!(!lines[1].contains("old-answer"));
+    }
+
+    #[test]
+    fn new_layout_preview_returns_first_user_message() {
+        let root = test_root("preview");
+        let path = root.join("messages.jsonl");
+        write_messages_jsonl(
+            &path,
+            &[
+                json!({
+                    "id": "s1",
+                    "payload": { "type": "session_start", "content": "system prompt" }
+                }),
+                json!({
+                    "id": "u1",
+                    "payload": { "type": "user", "content": "第一条消息" }
+                }),
+            ],
+        );
+
+        let preview = new_layout_preview(&path);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(preview, "第一条消息");
     }
 }

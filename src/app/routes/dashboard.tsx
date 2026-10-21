@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowRight, Bot, Brain, Code, Flame, Terminal, Sparkles, MousePointer2, Gem, Orbit, Pi } from "lucide-react";
+import { ArrowRight, Bot, Brain, Code, Flame, Terminal, Sparkles, MousePointer2, Gem, Orbit, Pi, Zap } from "lucide-react";
 import { Link } from "react-router";
 import { Button } from "@/components/ui/button";
 import { AppLogo } from "@/components/logo";
@@ -97,6 +97,16 @@ const platformMeta = [
     border: "border-zinc-400/20 hover:border-orange-400/40",
     iconBg: "bg-zinc-400/15 text-zinc-300 group-hover:scale-110",
     hoverGlow: "hover:shadow-[0_8px_30px_rgba(249,115,22,0.12)] hover:-translate-y-1"
+  },
+  {
+    key: "zcode",
+    label: "ZCode",
+    icon: Zap,
+    to: "/zcode",
+    gradient: "from-cyan-500/10 to-teal-600/5",
+    border: "border-cyan-500/20 hover:border-cyan-500/40",
+    iconBg: "bg-cyan-500/15 text-cyan-400 group-hover:scale-110",
+    hoverGlow: "hover:shadow-[0_8px_30px_rgba(6,182,212,0.12)] hover:-translate-y-1"
   },
 ] as const;
 
